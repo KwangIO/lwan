@@ -84,6 +84,7 @@ static void *find_handler(const char *name)
 
 static const struct lwan_module *find_module(const char *name)
 {
+/*
     extern const struct lwan_module_info SECTION_START(lwan_module);
     extern const struct lwan_module_info SECTION_END(lwan_module);
     const struct lwan_module_info *module;
@@ -92,7 +93,7 @@ static const struct lwan_module *find_module(const char *name)
         if (!strcmp(module->name, name))
             return module->module;
     }
-
+*/
     return NULL;
 }
 
