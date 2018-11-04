@@ -23,6 +23,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
@@ -559,6 +560,112 @@ void lwan_thread_add_client(struct lwan_thread *t, int fd)
     close(fd);
 }
 
+#if defined(__linux__) && defined(__x86_64__)
+static bool read_cpu_topology(struct lwan *l, uint32_t siblings[])
+{
+    char path[PATH_MAX];
+
+    for (unsigned short i = 0; i < l->n_cpus; i++) {
+        FILE *sib;
+        uint32_t id, sibling;
+
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu%hd/topology/thread_siblings_list",
+                 i);
+
+        sib = fopen(path, "re");
+        if (!sib) {
+            lwan_status_warning("Could not open `%s` to determine CPU topology",
+                                path);
+            return false;
+        }
+
+        switch (fscanf(sib, "%u-%u", &id, &sibling)) {
+        case 1: /* No SMT */
+            siblings[i] = id;
+            break;
+        case 2: /* SMT */
+            siblings[i] = sibling;
+            break;
+        default:
+            lwan_status_critical("%s has invalid format", path);
+            __builtin_unreachable();
+        }
+
+        fclose(sib);
+    }
+
+    return true;
+}
+
+static void
+siblings_to_schedtbl(struct lwan *l, uint32_t siblings[], uint32_t schedtbl[])
+{
+    int *seen = alloca(l->n_cpus * sizeof(int));
+    int n_schedtbl = 0;
+
+    for (uint32_t i = 0; i < l->n_cpus; i++)
+        seen[i] = -1;
+
+    for (uint32_t i = 0; i < l->n_cpus; i++) {
+        if (seen[siblings[i]] < 0) {
+            seen[siblings[i]] = (int)i;
+        } else {
+            schedtbl[n_schedtbl++] = (uint32_t)seen[siblings[i]];
+            schedtbl[n_schedtbl++] = i;
+        }
+    }
+
+    if (!n_schedtbl)
+        memcpy(schedtbl, seen, l->n_cpus * sizeof(int));
+}
+
+static void
+topology_to_schedtbl(struct lwan *l, uint32_t schedtbl[], uint32_t n_threads)
+{
+    uint32_t *siblings = alloca(l->n_cpus * sizeof(uint32_t));
+
+    if (!read_cpu_topology(l, siblings)) {
+        for (uint32_t i = 0; i < n_threads; i++)
+            schedtbl[i] = (i / 2) % l->thread.count;
+    } else {
+        uint32_t *affinity = alloca(l->n_cpus * sizeof(uint32_t));
+
+        siblings_to_schedtbl(l, siblings, affinity);
+
+        for (uint32_t i = 0; i < n_threads; i++)
+            schedtbl[i] = affinity[i % l->n_cpus];
+    }
+}
+
+static void
+adjust_threads_affinity(struct lwan *l, uint32_t *schedtbl, uint32_t mask)
+{
+    for (uint32_t i = 0; i < l->thread.count; i++) {
+        cpu_set_t set;
+
+        CPU_ZERO(&set);
+        CPU_SET(schedtbl[i & mask], &set);
+
+        if (pthread_setaffinity_np(l->thread.threads[i].self, sizeof(set),
+                                   &set))
+            lwan_status_warning("Could not set affinity for thread %d", i);
+    }
+}
+#elif defined(__x86_64__)
+static void
+topology_to_schedtbl(struct lwan *l, uint32_t schedtbl[], uint32_t n_threads)
+{
+    for (uint32_t i = 0; i < n_threads; i++)
+        schedtbl[i] = (i / 2) % l->thread.count;
+}
+
+static void
+adjust_threads_affinity(struct lwan *l, uint32_t *schedtbl, uint32_t n)
+{
+}
+#endif
+
 void lwan_thread_init(struct lwan *l)
 {
     if (pthread_barrier_init(&l->thread.barrier, NULL,
@@ -584,20 +691,19 @@ void lwan_thread_init(struct lwan *l)
      * fast path.
      *
      * Since struct lwan_connection is guaranteed to be 32-byte long, two of
-     * them can fill up a cache line.  This formula will group two connections
-     * per thread in a way that false-sharing is avoided.
+     * them can fill up a cache line.  Assume siblings share cache lines and
+     * use the CPU topology to group two connections per cache line in such
+     * a way that false sharing is avoided.
      */
     uint32_t n_threads = (uint32_t)lwan_nextpow2((size_t)((l->thread.count - 1) * 2));
-    uint32_t *fd_to_thread = alloca(n_threads * sizeof(uint32_t));
+    uint32_t *schedtbl = alloca(n_threads * sizeof(uint32_t));
 
-    for (unsigned int i = 0; i < n_threads; i++) {
-        /* TODO: do not assume the CPU topology */
-        fd_to_thread[i] = (i / 2) % l->thread.count;
-    }
+    topology_to_schedtbl(l, schedtbl, n_threads);
+
     n_threads--; /* Transform count into mask for AND below */
-
+    adjust_threads_affinity(l, schedtbl, n_threads);
     for (unsigned int i = 0; i < total_conns; i++)
-        l->conns[i].thread = &l->thread.threads[fd_to_thread[i & n_threads]];
+        l->conns[i].thread = &l->thread.threads[schedtbl[i & n_threads]];
 #else
     for (unsigned int i = 0; i < total_conns; i++)
         l->conns[i].thread = &l->thread.threads[i % l->thread.count];
